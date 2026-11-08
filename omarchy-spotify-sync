@@ -1,0 +1,453 @@
+#!/bin/bash
+
+# Writes the Omarchy theme for Spotify into Spicetify and loads it into Spotify.
+#
+# Colors come from the current Omarchy theme's colors.toml. Corner rounding
+# and the font come from the same places the Omarchy shell reads them:
+# Hyprland's decoration:rounding and fc-match monospace.
+#
+# A running Spotify picks the change up in a second or two without a restart:
+# theme.js in the Omarchy theme watches user.css and swaps the stylesheets.
+#
+#   omarchy-spotify-sync            write the theme, refresh Spotify if it changed
+#   omarchy-spotify-sync --reapply  also re-patch Spotify (after a Spotify update)
+#
+# Settings in ~/.config/omarchy/spotify.conf (all optional):
+#   font=all       Omarchy font for the whole UI (default)
+#   font=none      leave Spotify's fonts alone
+#   rounding=yes   follow Hyprland's rounding (default), "no" keeps Spotify's
+
+set -uo pipefail
+
+THEME_DIR="$HOME/.local/state/omarchy/current/theme"
+CONFIG="$HOME/.config/omarchy/spotify.conf"
+SPICETIFY_THEME="$HOME/.config/spicetify/Themes/Omarchy"
+SPOTIFY_APPS="/opt/spotify/Apps"
+
+reapply=no
+[[ ${1:-} == --reapply ]] && reapply=yes
+
+command -v spicetify >/dev/null || {
+  echo "omarchy-spotify-sync: spicetify is not installed" >&2
+  exit 1
+}
+[[ -f $THEME_DIR/colors.toml ]] || {
+  echo "omarchy-spotify-sync: no colors.toml in the current Omarchy theme" >&2
+  exit 1
+}
+
+font_mode=all
+rounding_mode=yes
+if [[ -f $CONFIG ]]; then
+  while IFS='=' read -r key value; do
+    key="${key//[[:space:]]/}"
+    value="${value%%#*}"
+    value="${value//[[:space:]]/}"
+    case "$key" in
+      font) font_mode="$value" ;;
+      rounding) rounding_mode="$value" ;;
+    esac
+  done < <(grep -v '^[[:space:]]*#' "$CONFIG")
+fi
+
+# Palette. Every color is derived from the theme in one awk pass, so dark and
+# light themes get the same treatment:
+#
+# - Surfaces step from the background toward the foreground, like Spotify's
+#   own greys step up from #121212.
+# - The window frame and the player bar use the darkest background, the panels
+#   the normal one, as stock Spotify puts #121212 panels on #000.
+# - "accent_text" is the accent pushed away from the background until it reads
+#   as text (4.5:1). Batou's grey accent would otherwise vanish.
+# - "accent_fill" is the accent as a fill (play button, toggles), pushed to at
+#   least 3:1 against the background so it stands out. "on_accent" is the theme
+#   color, or black or white, that reads best on top of it.
+# - Error red, warning orange and info blue stay Spotify's own. They carry
+#   meaning, and plenty of Omarchy themes have a grey "red".
+palette=$(omarchy-theme-color --file "$THEME_DIR/colors.toml" --all | awk -F'\t' '
+  { c[$1] = $2 }
+  function hex(s) { return tolower(substr(s, 1, 1) == "#" ? substr(s, 2) : s) }
+  function ch(h, i) { return index("0123456789abcdef", substr(h, i, 1)) - 1 }
+  function comp(h, n) { return ch(h, 2 * n - 1) * 16 + ch(h, 2 * n) }
+  function lin(v) { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ^ 2.4 }
+  function lum(h) { return 0.2126 * lin(comp(h, 1)) + 0.7152 * lin(comp(h, 2)) + 0.0722 * lin(comp(h, 3)) }
+  function contrast(a, b,   x, y) { x = lum(a); y = lum(b); return x > y ? (x + 0.05) / (y + 0.05) : (y + 0.05) / (x + 0.05) }
+  function mix(a, b, t,   i, out, v) {
+    out = ""
+    for (i = 1; i <= 3; i++) { v = int(comp(a, i) * (1 - t) + comp(b, i) * t + 0.5); out = out sprintf("%02x", v) }
+    return out
+  }
+  # Moves color a toward b in small steps until it has ratio against bg.
+  function push(a, b, bg, ratio,   t, m) {
+    for (t = 0; t <= 1; t += 0.02) { m = mix(a, b, t); if (contrast(m, bg) >= ratio) return m }
+    return b
+  }
+  function key(k, fallback) { return (k in c && c[k] ~ /^#[0-9a-fA-F]{6}$/) ? hex(c[k]) : fallback }
+  END {
+    bg = key("background", "121212")
+    fg = key("foreground", "ffffff")
+    ac = key("accent", "1ed760")
+    dark = lum(bg) < lum(fg)
+    outer = key("darker_background", mix(bg, dark ? "000000" : "ffffff", 0.3))
+    far = dark ? "ffffff" : "000000"
+
+    accent_text = push(ac, far, bg, 4.5)
+    accent_fill = push(ac, far, bg, 3)
+    on = contrast(outer, accent_fill) >= contrast(fg, accent_fill) ? outer : fg
+    if (contrast(on, accent_fill) < 4.5)
+      on = contrast("000000", accent_fill) >= contrast("ffffff", accent_fill) ? "000000" : "ffffff"
+
+    p["mode"] = dark ? "dark" : "light"
+    p["bg"] = bg; p["fg"] = fg; p["outer"] = outer
+    p["subtext"] = push(mix(fg, bg, 0.3), fg, bg, 4.5)
+    p["subdued"] = mix(fg, bg, 0.45)
+    p["card"] = mix(bg, fg, 0.04)
+    p["elevated"] = mix(bg, fg, 0.07)
+    p["highlight"] = mix(bg, fg, 0.11)
+    p["press"] = mix(bg, fg, 0.16)
+    p["elevated_highlight"] = mix(bg, fg, 0.14)
+    p["disabled"] = mix(bg, fg, 0.25)
+    p["border"] = mix(bg, fg, 0.14)
+    p["outer_highlight"] = mix(outer, fg, 0.06)
+    p["outer_press"] = mix(outer, fg, 0.12)
+    p["accent_text"] = accent_text
+    p["accent_fill"] = accent_fill
+    p["accent_hover"] = mix(accent_fill, far, 0.12)
+    p["accent_press"] = mix(accent_fill, bg, 0.15)
+    p["on_accent"] = on
+    p["inverted_highlight"] = mix(fg, bg, 0.06)
+    p["inverted_press"] = mix(fg, bg, 0.2)
+    p["inverted_subtext"] = mix(bg, fg, 0.35)
+    p["muted"] = key("muted", mix(bg, fg, 0.3))
+    p["bg_rgb"] = comp(bg, 1) "," comp(bg, 2) "," comp(bg, 3)
+    for (k in p) printf "%s=%s\n", k, p[k]
+  }')
+
+declare -A P
+while IFS='=' read -r k v; do P[$k]=$v; done <<<"$palette"
+
+color_ini() {
+  cat <<EOF
+; Written by omarchy-spotify-sync from the current Omarchy theme. Edits are overwritten.
+[omarchy]
+text               = ${P[fg]}
+subtext            = ${P[subtext]}
+main               = ${P[bg]}
+main-elevated      = ${P[elevated]}
+highlight          = ${P[highlight]}
+highlight-elevated = ${P[elevated_highlight]}
+sidebar            = ${P[outer]}
+player             = ${P[outer]}
+card               = ${P[card]}
+shadow             = 000000
+selected-row       = ${P[fg]}
+button             = ${P[accent_text]}
+button-active      = ${P[accent_fill]}
+button-disabled    = ${P[disabled]}
+tab-active         = ${P[highlight]}
+notification       = ${P[accent_fill]}
+notification-error = e22134
+misc               = ${P[muted]}
+EOF
+}
+
+colors_css() {
+  local scheme=${P[mode]} shade="#0009"
+  # Page headers fade from the album color through this (see theme.js). Light
+  # themes fade through their own background instead of black.
+  [[ $scheme == light ]] && shade="rgba(${P[bg_rgb]}, 0.75)"
+  cat <<EOF
+/* Omarchy theme for Spotify, written by omarchy-spotify-sync. Edits are overwritten. */
+
+/*
+ * Spotify defines its colors in "encore" sets inside @layer encore. Rules
+ * outside a layer win over it, so these only need to match its selectors.
+ * Spicetify already maps the main tokens to color.ini; this fills in the
+ * greys and greens it leaves hardcoded.
+ */
+.encore-dark-theme,
+.encore-dark-theme .encore-base-set {
+  color-scheme: $scheme;
+  --omarchy-shade: $shade;
+  --background-elevated-press: #${P[press]};
+  --background-press: #${P[press]};
+  --essential-subdued: #${P[subdued]};
+  --decorative-subdued: #${P[border]};
+}
+
+/* The window frame: top bar, search and the space around the panels */
+.encore-dark-theme .encore-app-frame-set,
+.encore-dark-theme .encore-muted-accent-set {
+  color-scheme: $scheme;
+  --background-highlight: #${P[outer_highlight]};
+  --background-press: #${P[outer_press]};
+  --background-elevated-base: #${P[outer_highlight]};
+  --background-elevated-press: #${P[outer]};
+  --text-subdued: #${P[subtext]};
+  --essential-subdued: #${P[subdued]};
+  --decorative-subdued: #${P[border]};
+}
+
+/* Play buttons, toggles and other accent fills */
+.encore-dark-theme .encore-bright-accent-set,
+.encore-dark-theme .encore-positive-set {
+  --background-base: #${P[accent_fill]};
+  --background-highlight: #${P[accent_hover]};
+  --background-press: #${P[accent_press]};
+  --background-elevated-base: #${P[accent_hover]};
+  --background-elevated-highlight: #${P[accent_hover]};
+  --background-elevated-press: #${P[accent_press]};
+  --background-tinted-base: #${P[accent_fill]};
+  --background-tinted-highlight: #${P[accent_hover]};
+  --background-tinted-press: #${P[accent_press]};
+  --text-base: #${P[on_accent]};
+  --text-subdued: #${P[on_accent]};
+  --text-bright-accent: #${P[on_accent]};
+  --text-positive: #${P[on_accent]};
+  --essential-base: #${P[on_accent]};
+  --essential-subdued: #${P[on_accent]};
+  --essential-bright-accent: #${P[on_accent]};
+  --essential-positive: #${P[on_accent]};
+  --decorative-base: #${P[on_accent]};
+  --decorative-subdued: #${P[accent_press]};
+}
+
+/* Tooltips, the white pill buttons and other inverted surfaces */
+.encore-dark-theme .encore-inverted-set,
+.encore-dark-theme .encore-inverted-light-set {
+  --background-highlight: #${P[inverted_highlight]};
+  --background-press: #${P[inverted_press]};
+  --background-elevated-base: #${P[inverted_highlight]};
+  --background-elevated-highlight: #${P[inverted_highlight]};
+  --background-elevated-press: #${P[inverted_press]};
+  --text-base: #${P[bg]};
+  --text-subdued: #${P[inverted_subtext]};
+  --text-bright-accent: #${P[bg]};
+  --essential-base: #${P[bg]};
+  --essential-subdued: #${P[inverted_subtext]};
+  --essential-bright-accent: #${P[bg]};
+  --decorative-base: #${P[bg]};
+}
+
+/* The library sidebar is a panel like the main view, not part of the frame */
+.Root__nav-bar {
+  background-color: var(--spice-main) !important;
+}
+
+/* Popups and menus get a 1px border instead of a blurred shadow, like Hyprland windows */
+#context-menu > ul,
+.main-contextMenu-menu,
+[data-tippy-root] .main-contextMenu-menu {
+  border: 1px solid #${P[border]};
+  box-shadow: none;
+}
+
+::selection {
+  background-color: #${P[accent_fill]};
+  color: #${P[on_accent]};
+}
+EOF
+}
+
+# Spotify's corner scale is 2, 4, 6, 8 and 16px, with 8px on the panels.
+# Treating Hyprland's rounding as the 8px step keeps those proportions, so
+# rounding = 8 gives stock Spotify and rounding = 0 gives square corners.
+rounding_css() {
+  local r
+  [[ $rounding_mode == yes ]] || return 0
+  r=$(hyprctl -j getoption decoration:rounding 2>/dev/null | jq -r '.int // empty' 2>/dev/null)
+  [[ $r =~ ^[0-9]+$ ]] || return 0
+
+  cat <<EOF
+
+
+/* Corner rounding from Hyprland (decoration:rounding = $r) */
+:root,
+.encore-dark-theme,
+.encore-light-theme {
+  --encore-corner-radius-smaller-2: $((r / 8))px;
+  --encore-corner-radius-smaller: $((r / 4))px;
+  --encore-corner-radius-base: $((r / 2))px;
+  --encore-corner-radius-larger: $((r * 3 / 4))px;
+  --encore-corner-radius-larger-2: ${r}px;
+  --encore-corner-radius-larger-3: $((r * 2))px;
+}
+EOF
+
+  # Spotify hardcodes 8px on the panels and a few other spots instead of
+  # using its scale. At rounding 8 they already match.
+  (( r == 8 )) && return 0
+
+  cat <<EOF
+
+/* The three panels, the now playing view and the queue */
+.Root__nav-bar,
+.Root__main-view,
+.Root__right-sidebar,
+.Root__right-sidebar > *,
+.Root__right-sidebar-peek,
+.Root__right-sidebar-peekContent,
+.Root__right-sidebar-overlayWrapper,
+.main-yourLibraryX-libraryContainer,
+.main-view-container,
+.main-view-container__scroll-node {
+  border-radius: ${r}px !important;
+}
+
+/* Cards, menus, the search box and album art in lists */
+.main-card-card,
+.main-contextMenu-menu,
+#context-menu > ul,
+[role="menu"],
+[role="dialog"],
+.main-trackList-rowImage,
+.main-coverSlotExpanded-container,
+.cover-art,
+.cover-art-image,
+.main-image-image:not(.main-avatar-image) {
+  border-radius: var(--encore-corner-radius-base) !important;
+}
+EOF
+}
+
+font_css() {
+  local family
+  [[ $font_mode == all ]] || return 0
+  family=$(fc-match -f '%{family[0]}' monospace 2>/dev/null)
+  [[ -n $family ]] || return 0
+  family="${family//\"/}"
+
+  cat <<EOF
+
+
+/* Font from Omarchy ($family) */
+:root,
+body {
+  --encore-body-font-stack: "$family", var(--fallback-fonts, sans-serif);
+  --encore-title-font-stack: "$family", var(--fallback-fonts, sans-serif);
+  --encore-variable-font-stack: "$family", var(--fallback-fonts, sans-serif);
+  --encore-bodyMono-font-stack: "$family", var(--fallback-fonts, monospace);
+}
+body,
+input,
+button,
+textarea {
+  font-family: "$family", var(--fallback-fonts, sans-serif);
+}
+EOF
+}
+
+# theme.js does two things CSS can't:
+#
+# - Watches user.css and swaps Spotify's theme stylesheets when it changes, so
+#   a theme switch shows up without restarting Spotify (and the music).
+# - Page headers fade from the album color through a hardcoded 60% black
+#   (#0009) into the background. On a light theme that's a muddy grey band.
+#   Their class names are hashes Spicetify doesn't map, so instead of matching
+#   them, this rewrites #0009 in any gradient that ends in Spotify's background
+#   or noise to var(--omarchy-shade), which user.css sets per theme. It also
+#   covers stylesheets Spotify loads later, when you open a new kind of page.
+theme_js() {
+  cat <<'EOF'
+// Omarchy theme for Spotify. Written by omarchy-spotify-sync.
+(function omarchyTheme() {
+  const files = ["user.css", "colors.css"];
+  let last = null;
+
+  async function check() {
+    try {
+      const res = await fetch("user.css?t=" + Date.now(), { cache: "no-store" });
+      const text = await res.text();
+      if (last !== null && text !== last) {
+        for (const link of document.querySelectorAll("link[rel=stylesheet]")) {
+          const href = link.getAttribute("href") || "";
+          const name = files.find((f) => href.split("?")[0].endsWith(f));
+          if (name) link.setAttribute("href", name + "?t=" + Date.now());
+        }
+      }
+      last = text;
+    } catch (e) {}
+  }
+
+  const DARK = /#0009|rgba\(0,\s*0,\s*0,\s*0?\.6\)/g;
+  const done = new WeakSet();
+
+  function fixRules(rules) {
+    for (const rule of rules) {
+      if (rule.cssRules) fixRules(rule.cssRules);
+      if (!rule.style) continue;
+      for (const prop of ["background", "background-image"]) {
+        const value = rule.style.getPropertyValue(prop);
+        if (value && value.includes("gradient") && /--background-(base|noise)/.test(value) && DARK.test(value)) {
+          DARK.lastIndex = 0;
+          rule.style.setProperty(prop, value.replace(DARK, "var(--omarchy-shade)"));
+        }
+        DARK.lastIndex = 0;
+      }
+    }
+  }
+
+  function fixSheets() {
+    for (const sheet of document.styleSheets) {
+      if (done.has(sheet)) continue;
+      try {
+        fixRules(sheet.cssRules);
+        done.add(sheet);
+      } catch (e) {}
+    }
+  }
+
+  fixSheets();
+  new MutationObserver(fixSheets).observe(document.head, { childList: true });
+  document.addEventListener("load", fixSheets, true);
+
+  check();
+  setInterval(check, 1500);
+})();
+EOF
+}
+
+mkdir -p "$SPICETIFY_THEME"
+
+write() {
+  local target="$SPICETIFY_THEME/$1" content="$2"
+  if [[ -f $target ]] && [[ $(cat "$target") == "$content" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$content" >"$target.tmp" && mv -f "$target.tmp" "$target"
+}
+
+changed=no
+write color.ini "$(color_ini)" && changed=yes
+write user.css "$(colors_css)$(rounding_css)$(font_css)" && changed=yes
+write theme.js "$(theme_js)" && changed=yes
+
+# Point Spicetify at the theme. Writing config only when a value differs keeps
+# it quiet on a normal theme switch.
+want=(current_theme Omarchy color_scheme omarchy inject_css 1 replace_colors 1 inject_theme_js 1 check_spicetify_update 0)
+for ((i = 0; i < ${#want[@]}; i += 2)); do
+  if [[ $(spicetify config "${want[i]}" 2>/dev/null) != "${want[i + 1]}" ]]; then
+    spicetify -q config "${want[i]}" "${want[i + 1]}" >/dev/null 2>&1
+    changed=yes
+  fi
+done
+
+if [[ ! -w $SPOTIFY_APPS ]]; then
+  echo "omarchy-spotify-sync: $SPOTIFY_APPS is not writable, so Spicetify can't patch Spotify. Run install.sh again." >&2
+  exit 1
+fi
+
+# Spicetify unpacks xpui.spa into an xpui folder when it patches Spotify.
+# A Spotify update puts the packed file back, so a missing folder means the
+# patch is gone and the old backup belongs to the previous version.
+if [[ $reapply == yes || ! -d $SPOTIFY_APPS/xpui ]]; then
+  if [[ -f $SPOTIFY_APPS/xpui.spa ]]; then
+    spicetify -q clear >/dev/null 2>&1 || true
+    spicetify -q -n backup apply
+  else
+    spicetify -q -n apply
+  fi
+  echo "omarchy-spotify-sync: patched Spotify. Restart it once to load the theme."
+elif [[ $changed == yes ]]; then
+  spicetify -q -n refresh
+fi

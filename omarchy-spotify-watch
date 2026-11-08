@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Reruns omarchy-spotify-sync whenever Hyprland reloads its config, so changing
+# rounding in OmaControl or looknfeel.lua reaches Spotify without a theme switch.
+
+sync() { "$HOME/.local/bin/omarchy-spotify-sync" || true; }
+
+while true; do
+  socket="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock"
+  if [[ -S $socket ]]; then
+    sync
+    socat -U - "UNIX-CONNECT:$socket" 2>/dev/null | while IFS= read -r event; do
+      [[ $event == configreloaded* ]] && sync
+    done
+  fi
+  sleep 5
+done

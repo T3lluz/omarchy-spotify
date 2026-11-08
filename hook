@@ -1,0 +1,3 @@
+#!/bin/bash
+# Rewrites Spotify's Omarchy theme after a theme or font change.
+"$HOME/.local/bin/omarchy-spotify-sync"

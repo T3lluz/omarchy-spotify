@@ -1,0 +1,12 @@
+# Installed by omarchy-spotify. A Spotify update replaces /opt/spotify, which
+# drops Spicetify's patch and the write access it needs. This puts both back.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = spotify
+
+[Action]
+Description = Re-applying the Omarchy theme to Spotify...
+When = PostTransaction
+Exec = /bin/sh -c 'chown -R @USER@:@USER@ /opt/spotify; runuser -u @USER@ -- env HOME=@HOME@ @HOME@/.local/bin/omarchy-spotify-sync --reapply || true'
